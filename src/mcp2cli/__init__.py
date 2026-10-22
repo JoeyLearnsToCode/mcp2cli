@@ -4045,7 +4045,7 @@ def session_start(
         _session_sock_path(name).unlink(missing_ok=True)
 
     # Spawn daemon
-    daemon_script = json.dumps(
+    daemon_config = json.dumps(
         {
             "name": name,
             "source": source,
@@ -4067,17 +4067,22 @@ def session_start(
             [
                 sys.executable,
                 "-c",
-                f"import mcp2cli; mcp2cli._run_session_daemon({json.dumps(daemon_script)})",
+                "import sys, mcp2cli; mcp2cli._run_session_daemon(sys.stdin.read())",
             ],
             start_new_session=True,
             stdout=log_file,
             stderr=log_file,
             stdin=subprocess.PIPE,
         )
-    # The daemon never reads stdin; closing the write end hands it EOF and
-    # leaves no descriptor behind in the parent.
+    # Keep resolved headers, environment values and source URLs out of argv.
+    # Closing the pipe completes the daemon's read and releases our descriptor.
     if proc.stdin is not None:
-        proc.stdin.close()
+        try:
+            with proc.stdin:
+                proc.stdin.write(daemon_config.encode("utf-8"))
+        except BrokenPipeError:
+            # The daemon exited before reading its config; report that below.
+            pass
 
     # Wait for socket to appear
     sock_path = _session_sock_path(name)
