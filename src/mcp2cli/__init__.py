@@ -1833,7 +1833,11 @@ def extract_openapi_commands(spec: dict) -> list[CommandDef]:
                     location=param.get("in", "query"),
                     schema=schema,
                     style=param.get("style"),
-                    explode=param.get("explode", False),
+                    explode=param.get(
+                        "explode",
+                        param.get("in", "query") == "query"
+                        and param.get("style", "form") == "form",
+                    ),
                 )
                 params.append(p)
 
@@ -3283,6 +3287,30 @@ def _collect_openapi_params(
     return path, query_params, extra_headers, body, files
 
 
+def _serialize_openapi_query_params(cmd: CommandDef, query_params: dict) -> str:
+    """Encode query array atoms before joining their OpenAPI delimiters."""
+    parameters = {p.original_name: p for p in cmd.params if p.location == "query"}
+    parts = []
+    for name, value in query_params.items():
+        param = parameters[name]
+        separator = {"form": ",", "spaceDelimited": "%20", "pipeDelimited": "%7C"}.get(
+            param.style or "form"
+        )
+        if isinstance(value, list) and not param.explode and separator is not None:
+            if not value:
+                continue
+            atoms = [
+                quote(str(item).lower() if isinstance(item, bool) else str(item), safe="")
+                for item in value
+                if item is not None
+            ]
+            if atoms:
+                parts.append(f"{quote(name, safe='')}={separator.join(atoms)}")
+        else:
+            parts.append(str(httpx.QueryParams({name: value})))
+    return "&".join(part for part in parts if part)
+
+
 def execute_openapi(
     args: argparse.Namespace,
     cmd: CommandDef,
@@ -3297,6 +3325,10 @@ def execute_openapi(
 ):
     path, query_params, extra_headers, body, files = _collect_openapi_params(cmd, args)
     url = base_url.rstrip("/") + path
+    if query_params:
+        url = httpx.URL(url).copy_with(
+            query=_serialize_openapi_query_params(cmd, query_params).encode("ascii")
+        )
 
     is_multipart = files is not None or cmd.content_type == "multipart/form-data"
     headers = _build_http_headers(auth_headers, multipart=is_multipart)
@@ -3309,7 +3341,6 @@ def execute_openapi(
                     (cmd.method or "get").upper(),
                     url,
                     headers=headers,
-                    params=query_params or None,
                     data=body,
                     files=files,
                 )
@@ -3318,7 +3349,6 @@ def execute_openapi(
                     (cmd.method or "get").upper(),
                     url,
                     headers=headers,
-                    params=query_params or None,
                     data=body,
                 )
             else:
@@ -3326,7 +3356,6 @@ def execute_openapi(
                     (cmd.method or "get").upper(),
                     url,
                     headers=headers,
-                    params=query_params or None,
                     json=body,
                 )
             _handle_http_error(resp)
