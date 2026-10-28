@@ -130,3 +130,48 @@ def test_query_array_wire_values(
     data = json.loads(result.stdout)
     assert data["query"].get("tags") == expected
     assert data["raw_query"] == raw_query
+
+
+def test_query_params_extend_a_query_already_in_the_path(tmp_path, query_endpoint):
+    spec = {
+        "openapi": "3.0.4",
+        "info": {"title": "Fixed query", "version": "1"},
+        "servers": [{"url": query_endpoint}],
+        "paths": {
+            "/items?kind=widget": {
+                "get": {
+                    "operationId": "listWidgets",
+                    "parameters": [
+                        {
+                            "name": "tags",
+                            "in": "query",
+                            "explode": False,
+                            "schema": {"type": "array", "items": {}},
+                        }
+                    ],
+                    "responses": {"200": {"description": "Observed query parameters"}},
+                },
+            },
+        },
+    }
+    spec_path = tmp_path / "openapi.json"
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "mcp2cli",
+            "--spec",
+            str(spec_path),
+            "--json",
+            "list-widgets",
+            "--tags",
+            '["a","b"]',
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["raw_query"] == "kind=widget&tags=a,b"

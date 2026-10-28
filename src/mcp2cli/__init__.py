@@ -3326,9 +3326,13 @@ def execute_openapi(
     path, query_params, extra_headers, body, files = _collect_openapi_params(cmd, args)
     url = base_url.rstrip("/") + path
     if query_params:
-        url = httpx.URL(url).copy_with(
-            query=_serialize_openapi_query_params(cmd, query_params).encode("ascii")
-        )
+        # Append to, rather than replace, any query string the spec path or
+        # base URL already carries (e.g. `/search?type=user`).
+        parsed = httpx.URL(url)
+        query = _serialize_openapi_query_params(cmd, query_params).encode("ascii")
+        if parsed.query:
+            query = parsed.query + b"&" + query
+        url = parsed.copy_with(query=query)
 
     is_multipart = files is not None or cmd.content_type == "multipart/form-data"
     headers = _build_http_headers(auth_headers, multipart=is_multipart)
