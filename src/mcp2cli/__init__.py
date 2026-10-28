@@ -24,7 +24,7 @@ import tempfile
 import threading
 import time
 import webbrowser
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -4050,7 +4050,7 @@ def session_start(
         _session_sock_path(name).unlink(missing_ok=True)
 
     # Spawn daemon
-    daemon_script = json.dumps(
+    daemon_config = json.dumps(
         {
             "name": name,
             "source": source,
@@ -4072,17 +4072,24 @@ def session_start(
             [
                 sys.executable,
                 "-c",
-                f"import mcp2cli; mcp2cli._run_session_daemon({json.dumps(daemon_script)})",
+                (
+                    "import sys; config = sys.stdin.read(); "
+                    "import mcp2cli; mcp2cli._run_session_daemon(config)"
+                ),
             ],
             start_new_session=True,
             stdout=log_file,
             stderr=log_file,
             stdin=subprocess.PIPE,
         )
-    # The daemon never reads stdin; closing the write end hands it EOF and
-    # leaves no descriptor behind in the parent.
+    # Keep resolved headers, environment values and source URLs out of argv.
+    # Read before importing mcp2cli so a large config cannot block our write
+    # during slow imports, before the startup timeout below takes effect.
+    # Closing the pipe completes the daemon's read and releases our descriptor.
     if proc.stdin is not None:
-        proc.stdin.close()
+        # An early exit can break either write or close; report it below.
+        with suppress(BrokenPipeError), proc.stdin:
+            proc.stdin.write(daemon_config.encode("utf-8"))
 
     # Wait for socket to appear
     sock_path = _session_sock_path(name)
