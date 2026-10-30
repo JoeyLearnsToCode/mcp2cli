@@ -183,15 +183,37 @@ def read_stdin_json(context: str):
         )
         sys.exit(1)
 
-_STDIN_MERGE_LOCATIONS = ("body", "tool_input", "graphql_arg")
+
+def parse_json_arg(raw: str, context: str):
+    """Parse the JSON request handed to --req-json on the command line."""
+    if not raw.strip():
+        print(
+            f"Error: --req-json expects JSON for {context}, but the value was empty.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        print(
+            f"Error: invalid JSON in --req-json for {context} "
+            f"(line {exc.lineno}, column {exc.colno}).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
-def _merge_stdin_flag_args(data, cmd, args, context: str):
-    """Merge explicitly passed parameter flags into the --stdin JSON object.
+_JSON_MERGE_LOCATIONS = ("body", "tool_input", "graphql_arg")
 
-    Without this, --stdin used the JSON verbatim and silently dropped every
-    parameter flag given alongside it. A flag that disagrees with the same key
-    in the JSON is an error rather than a silent override in either direction.
+
+def _merge_json_flag_args(data, cmd, args, context: str, source: str):
+    """Merge explicitly passed parameter flags into the JSON request object.
+
+    Without this, the JSON request used to be taken verbatim and silently
+    dropped every parameter flag given alongside it. A flag that disagrees with
+    the same key in the JSON is an error rather than a silent override in
+    either direction. *source* names the flag the JSON came from, so the error
+    points at the one the user actually typed.
     """
     flags = {}
     for p in cmd.params:
@@ -200,16 +222,16 @@ def _merge_stdin_flag_args(data, cmd, args, context: str):
             continue
         flag = f"--{p.cli_name or p.name}"
         if p.location == "file":
-            print(f"Error: {flag} cannot be combined with --stdin.", file=sys.stderr)
+            print(f"Error: {flag} cannot be combined with {source}.", file=sys.stderr)
             sys.exit(1)
-        if p.location in _STDIN_MERGE_LOCATIONS:
+        if p.location in _JSON_MERGE_LOCATIONS:
             flags[p.original_name] = (flag, coerce_value(val, p.schema))
     if not flags:
         return data
     if not isinstance(data, dict):
         names = ", ".join(flag for flag, _ in flags.values())
         print(
-            f"Error: {names} can only be merged into a JSON object on --stdin "
+            f"Error: {names} can only be merged into a JSON object on {source} "
             f"for {context}.",
             file=sys.stderr,
         )
@@ -224,13 +246,32 @@ def _merge_stdin_flag_args(data, cmd, args, context: str):
         merged[key] = value
     if conflicts:
         print(
-            f"Error: flags conflict with the --stdin JSON for {context}: "
+            f"Error: flags conflict with the {source} JSON for {context}: "
             + "; ".join(conflicts)
             + ". Pass each value in one place, or make them agree.",
             file=sys.stderr,
         )
         sys.exit(1)
     return merged
+
+
+def resolve_json_input(args, cmd, context: str):
+    """Return the JSON request supplied by --req-json or --stdin, else None.
+
+    Parameter flags are merged in, so a call can mix a JSON skeleton with a few
+    explicit overrides. --req-json keeps the request out of the shell pipeline,
+    which is the awkward part on Windows.
+    """
+    raw = getattr(args, "req_json", None)
+    if raw is not None:
+        return _merge_json_flag_args(
+            parse_json_arg(raw, context), cmd, args, context, "--req-json"
+        )
+    if getattr(args, "stdin", False) is True:
+        return _merge_json_flag_args(
+            read_stdin_json(context), cmd, args, context, "--stdin"
+        )
+    return None
 
 
 def split_shell_command(command: str) -> list[str]:
@@ -696,7 +737,7 @@ def _allocate_param_cli_names(
     natural_names = {p.name for p in cmd.params}
     used = {"help", *reserved}
     if cmd.has_body:
-        used.add("stdin")
+        used.update(("stdin", "req-json"))
 
     for p in cmd.params:
         name = p.name
@@ -2458,11 +2499,8 @@ def _build_graphql_document(
     types_by_name = {t["name"]: t for t in schema.get("types", []) if t.get("name")}
 
     # Build variables dict from args
-    if getattr(args, "stdin", False) is True:
-        variables = _merge_stdin_flag_args(
-            read_stdin_json("GraphQL variables"), cmd, args, "GraphQL variables"
-        )
-    else:
+    variables = resolve_json_input(args, cmd, "GraphQL variables")
+    if variables is None:
         variables = {}
         for p in cmd.params:
             val = getattr(args, _param_dest(p), None)
@@ -3096,12 +3134,21 @@ def build_argparse(
         sub.set_defaults(_cmd=cmd)
 
         if cmd.has_body:
-            sub.add_argument(
+            json_source = sub.add_mutually_exclusive_group()
+            json_source.add_argument(
                 "--stdin",
                 action="store_true",
                 default=False,
                 help="Read JSON body/arguments from stdin; parameter flags "
                 "are merged in (a conflicting value is an error)",
+            )
+            json_source.add_argument(
+                "--req-json",
+                metavar="JSON",
+                default=None,
+                help="JSON body/arguments given inline instead of piped to "
+                "--stdin; parameter flags are merged in (a conflicting value "
+                "is an error)",
             )
 
         if schema_flag:
@@ -3326,11 +3373,8 @@ def _collect_openapi_params(
             extra_headers[p.original_name] = str(val)
 
     if cmd.method != "get":
-        if getattr(args, "stdin", False) is True:
-            body = _merge_stdin_flag_args(
-                read_stdin_json("OpenAPI request body"), cmd, args, "OpenAPI request body"
-            )
-        else:
+        body = resolve_json_input(args, cmd, "OpenAPI request body")
+        if body is None:
             body = {}
             for p in cmd.params:
                 if p.location in ("path", "query", "header", "cookie"):
@@ -4740,11 +4784,8 @@ def handle_mcp(
         print_tool_schema(tools, cmd.tool_name or cmd.name, pretty=pretty)
         return
 
-    if getattr(args, "stdin", False) is True:
-        arguments = _merge_stdin_flag_args(
-            read_stdin_json("MCP tool arguments"), cmd, args, "MCP tool arguments"
-        )
-    else:
+    arguments = resolve_json_input(args, cmd, "MCP tool arguments")
+    if arguments is None:
         arguments = {}
         for p in cmd.params:
             val = getattr(args, _param_dest(p), None)
@@ -5380,12 +5421,10 @@ def _handle_session_operations(
     if getattr(args, "schema", False) is True:
         print_tool_schema(tools, cmd.tool_name or cmd.name, pretty=pre_args.pretty)
         return True
-    if getattr(args, "stdin", False) is True:
-        arguments = _merge_stdin_flag_args(
-            read_stdin_json(f"session {sess_name} tool arguments"),
-            cmd, args, f"session {sess_name} tool arguments",
-        )
-    else:
+    arguments = resolve_json_input(
+        args, cmd, f"session {sess_name} tool arguments"
+    )
+    if arguments is None:
         arguments = {}
         for p in cmd.params:
             val = getattr(args, _param_dest(p), None)

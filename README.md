@@ -134,6 +134,10 @@ mcp2cli --mcp-stdio "npx @modelcontextprotocol/server-filesystem /tmp" --list
 mcp2cli --mcp-stdio "npx @modelcontextprotocol/server-filesystem /tmp" \
   read-file --path /tmp/hello.txt
 
+# Or hand the whole argument object over as JSON, no shell pipe needed
+mcp2cli --mcp-stdio "npx @modelcontextprotocol/server-filesystem /tmp" \
+  read-file --req-json '{"path": "/tmp/hello.txt"}'
+
 # Pass environment variables to the server process
 mcp2cli --mcp-stdio "node server.js" --env API_KEY=sk-... --env DEBUG=1 \
   search --query "test"
@@ -197,10 +201,13 @@ mcp2cli --spec ./openapi.json --base-url https://api.example.com list-pets --sta
 # With auth
 mcp2cli --spec ./spec.json --auth-header "Authorization:Bearer tok_..." create-item --name "Test"
 
-# POST with JSON body from stdin
+# POST with a JSON body given inline
+mcp2cli --spec ./spec.json create-pet --req-json '{"name": "Fido", "tag": "dog"}'
+
+# ...or piped to stdin
 echo '{"name": "Fido", "tag": "dog"}' | mcp2cli --spec ./spec.json create-pet --stdin
 
-# Flags given with --stdin are merged into the JSON (a conflicting value is an error)
+# Flags given with --req-json/--stdin are merged into the JSON (a conflicting value is an error)
 echo '{"name": "Fido"}' | mcp2cli --spec ./spec.json create-pet --tag dog --stdin
 
 # Local YAML spec

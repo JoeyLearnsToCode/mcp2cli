@@ -204,11 +204,23 @@ mcp2cli --session work get-user-profile --schema
 Output is the server's own `tools/list` entry — `inputSchema`, `outputSchema`,
 `annotations`, and property names such as `fooBar` are never renamed.
 
-### POST with JSON body from stdin
+### JSON request body (`--req-json` / `--stdin`)
+
+Pass the whole request as one JSON object. `--req-json` takes it inline, which
+avoids the shell pipeline (and the quoting pain on Windows); `--stdin` reads the
+same JSON from stdin. Flags given alongside are merged in, and a value that
+disagrees with the JSON is an error.
 
 ```bash
+# Inline: OpenAPI body, MCP tool arguments, GraphQL variables
+mcp2cli --spec ./spec.json create-pet --req-json '{"name": "Fido", "tag": "dog"}'
+mcp2cli --mcp https://mcp.example.com/sse search --req-json '{"query": "test", "limit": 5}'
+
+# Piped stdin still works, and is what you want when a tool generated the JSON
 echo '{"name": "Fido", "tag": "dog"}' | mcp2cli --spec ./spec.json create-pet --stdin
 ```
+
+`--req-json` and `--stdin` are mutually exclusive.
 
 ### Multipart file uploads
 
