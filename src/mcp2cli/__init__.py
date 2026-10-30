@@ -689,10 +689,12 @@ def _param_dest(p: "ParamDef") -> str:
     return (p.cli_name or p.name).replace("-", "_")
 
 
-def _allocate_param_cli_names(cmd: "CommandDef") -> None:
+def _allocate_param_cli_names(
+    cmd: "CommandDef", reserved: tuple[str, ...] = ()
+) -> None:
     """Assign unique parameter flags without shadowing built-in options."""
     natural_names = {p.name for p in cmd.params}
-    used = {"help"}
+    used = {"help", *reserved}
     if cmd.has_body:
         used.add("stdin")
 
@@ -1907,6 +1909,53 @@ def extract_openapi_commands(spec: dict) -> list[CommandDef]:
 
 
 # ---------------------------------------------------------------------------
+# MCP: raw tool definitions
+# ---------------------------------------------------------------------------
+
+
+def tool_definition(tool) -> dict:
+    """Serialize one tool exactly as the server declared it.
+
+    ``--schema`` exists to show the wire contract, so the definition keeps the
+    server's own spelling -- ``inputSchema``/``outputSchema`` keys and property
+    names such as ``fooBar`` are never re-cased. Top-level fields the SDK fills
+    in as ``None`` are dropped; nested values are left untouched, because a
+    schema's ``"default": null`` is part of the contract.
+    """
+    if isinstance(tool, dict):
+        return tool
+    return {k: v for k, v in _mcp_dump(tool).items() if v is not None}
+
+
+def find_tool_definition(tools: list[dict], query: str) -> dict | None:
+    """Locate a tool by wire name, falling back to its kebab-case CLI alias.
+
+    ``--list`` shows the kebab name while ``--schema`` is documented with the
+    wire name, so accepting both keeps a name copied from either place working.
+    """
+    for tool in tools:
+        if tool.get("name") == query:
+            return tool
+    lowered = query.lower()
+    for tool in tools:
+        if to_kebab(tool.get("name", "")).lower() == lowered:
+            return tool
+    return None
+
+
+def print_tool_schema(tools: list[dict], query: str, pretty: bool = False) -> None:
+    """Print one tool's raw definition, or exit 1 when the name is unknown."""
+    tool = find_tool_definition(tools, query)
+    if tool is None:
+        print(
+            f"Error: no tool named {query!r}. Use --list to see available tools.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    _emit_json(tool_definition(tool), pretty)
+
+
+# ---------------------------------------------------------------------------
 # MCP: command extraction
 # ---------------------------------------------------------------------------
 
@@ -3021,7 +3070,15 @@ def build_argparse(
     *,
     prog: str = "mcp2cli",
     description: str = _DEFAULT_PARSER_DESCRIPTION,
+    schema_flag: bool = False,
 ) -> argparse.ArgumentParser:
+    """Build the subcommand parser.
+
+    *schema_flag* adds ``--schema`` to every MCP tool subcommand, so the raw
+    definition can be requested after the tool name (``... read-file --schema``).
+    OpenAPI and GraphQL subcommands never expose it -- neither has a raw tool
+    definition to print.
+    """
     parser = argparse.ArgumentParser(
         prog=prog,
         description=description,
@@ -3035,7 +3092,7 @@ def build_argparse(
             help=escape_argparse_help(cmd.description),
             description=escape_argparse_help(cmd.description),
         )
-        _allocate_param_cli_names(cmd)
+        _allocate_param_cli_names(cmd, reserved=("schema",) if schema_flag else ())
         sub.set_defaults(_cmd=cmd)
 
         if cmd.has_body:
@@ -3045,6 +3102,15 @@ def build_argparse(
                 default=False,
                 help="Read JSON body/arguments from stdin; parameter flags "
                 "are merged in (a conflicting value is an error)",
+            )
+
+        if schema_flag:
+            sub.add_argument(
+                "--schema",
+                action="store_true",
+                default=False,
+                help="Print this tool's raw definition (inputSchema and, when "
+                "the server declares one, outputSchema) instead of calling it",
             )
 
         cli_names = {p.cli_name or p.name for p in cmd.params}
@@ -4185,14 +4251,7 @@ async def _list_all_tools(session):
 
 async def _dispatch_list_tools(session, params):
     tools = await _list_all_tools(session)
-    return [
-        {
-            "name": t.name,
-            "description": t.description or "",
-            "inputSchema": _mcp_attr(t, "inputSchema") or {},
-        }
-        for t in tools
-    ]
+    return [tool_definition(t) for t in tools]
 
 
 async def _dispatch_call_tool(session, params):
@@ -4560,6 +4619,7 @@ def handle_mcp(
     top: int | None = None,
     compact: bool = False,
     json_output: bool = False,
+    schema_tool: str | None = None,
 ):
     # Build a config dict for cache key generation (future-proof)
     config_for_cache = {
@@ -4568,10 +4628,27 @@ def handle_mcp(
         'transport': transport,
         'env_vars': env_vars,
         'is_stdio': is_stdio,
+        # Bumped when the cached tool payload gains fields: entries written by
+        # an older mcp2cli hold only name/description/inputSchema, and reusing
+        # one would make --schema silently drop outputSchema and annotations.
+        'tool_payload_version': 2,
     }
 
     key = cache_key_override or cache_key_for(config_for_cache)
     src_hash = _source_hash_for(source)
+
+    # --schema TOOL prints one raw tool definition and stops; it bypasses
+    # --list and subcommand dispatch entirely.
+    if schema_tool:
+        print_tool_schema(
+            _fetch_or_cache_mcp_tools(
+                key, ttl, refresh, source, is_stdio, auth_headers, env_vars,
+                transport=transport, oauth_provider=oauth_provider,
+            ),
+            schema_tool,
+            pretty=pretty,
+        )
+        return
 
     # Resource/prompt/completion operations skip the tool flow entirely
     if resource_action or prompt_action or complete_spec:
@@ -4648,7 +4725,9 @@ def handle_mcp(
 
     pre = argparse.ArgumentParser(add_help=False)
     prog, description = _parser_branding(bake_config)
-    parser = build_argparse(commands, pre, prog=prog, description=description)
+    parser = build_argparse(
+        commands, pre, prog=prog, description=description, schema_flag=True,
+    )
     args = parser.parse_args(remaining)
 
     if not hasattr(args, "_cmd"):
@@ -4656,6 +4735,10 @@ def handle_mcp(
         sys.exit(1)
 
     cmd: CommandDef = args._cmd
+
+    if getattr(args, "schema", False) is True:
+        print_tool_schema(tools, cmd.tool_name or cmd.name, pretty=pretty)
+        return
 
     if getattr(args, "stdin", False) is True:
         arguments = _merge_stdin_flag_args(
@@ -4691,14 +4774,7 @@ def _fetch_mcp_tools(
 
     async def _extract_tools(session):
         all_tools = await _list_all_tools(session)
-        tools_result.extend(
-            {
-                "name": t.name,
-                "description": t.description or "",
-                "inputSchema": _mcp_attr(t, "inputSchema") or {},
-            }
-            for t in all_tools
-        )
+        tools_result.extend(tool_definition(t) for t in all_tools)
 
     async def _run():
         nonlocal tools_result
@@ -4856,6 +4932,18 @@ def _build_main_parser() -> argparse.ArgumentParser:
         dest="search_pattern",
         metavar="PATTERN",
         help="Search tools by name or description (case-insensitive substring match)",
+    )
+    pre.add_argument(
+        "--schema",
+        default=None,
+        dest="schema_tool",
+        metavar="TOOL",
+        help=(
+            "Print one MCP tool's raw definition (inputSchema and, when the "
+            "server declares one, outputSchema), with the server's own naming "
+            "preserved. Takes a wire name or the kebab-case name shown by --list. "
+            "May also be given after the tool name."
+        ),
     )
     pre.add_argument(
         "--verbose",
@@ -5200,6 +5288,14 @@ def _handle_session_operations(
         output_result(result, head=pre_args.head, **_sess_out)
         return True
 
+    if pre_args.schema_tool:
+        print_tool_schema(
+            _session_request(sess_name, "list_tools"),
+            pre_args.schema_tool,
+            pretty=pre_args.pretty,
+        )
+        return True
+
 
     if pre_args.list_resources:
         result = _session_request(sess_name, "list_resources")
@@ -5273,7 +5369,7 @@ def _handle_session_operations(
     tools = _session_request(sess_name, "list_tools")
     commands = extract_mcp_commands(tools)
     pre_for_session = argparse.ArgumentParser(add_help=False)
-    parser = build_argparse(commands, pre_for_session)
+    parser = build_argparse(commands, pre_for_session, schema_flag=True)
     args = parser.parse_args(remaining)
 
     if not hasattr(args, "_cmd"):
@@ -5281,6 +5377,9 @@ def _handle_session_operations(
         sys.exit(1)
 
     cmd: CommandDef = args._cmd
+    if getattr(args, "schema", False) is True:
+        print_tool_schema(tools, cmd.tool_name or cmd.name, pretty=pre_args.pretty)
+        return True
     if getattr(args, "stdin", False) is True:
         arguments = _merge_stdin_flag_args(
             read_stdin_json(f"session {sess_name} tool arguments"),
@@ -5476,6 +5575,15 @@ def _main_impl(argv: list[str], bake_config: BakeConfig | None = None):
     env_vars = dict(_parse_kv_list(pre_args.env, "=", "env"))
 
     _validate_source_modes(pre_args, pre, remaining)
+    if pre_args.schema_tool and not (
+        pre_args.mcp or pre_args.mcp_stdio or pre_args.session
+    ):
+        print(
+            "Error: --schema is only supported for MCP sources "
+            "(--mcp, --mcp-stdio, or --session).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     oauth_provider = _setup_oauth(pre_args)
 
     if _handle_session_operations(
@@ -5544,6 +5652,7 @@ def _main_impl(argv: list[str], bake_config: BakeConfig | None = None):
             top=pre_args.top,
             compact=pre_args.compact,
             json_output=pre_args.json_output,
+            schema_tool=pre_args.schema_tool,
         )
         return
 

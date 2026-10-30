@@ -77,6 +77,8 @@ Options:
   --refresh               Bypass cache
   --list                  List available subcommands
   --search PATTERN        Search tools by name or description (implies --list)
+  --schema TOOL           Print one MCP tool's raw definition (inputSchema,
+                          outputSchema, annotations); wire names preserved
   --fields FIELDS         Override GraphQL selection set (e.g. "id name email")
   --pretty                Pretty-print JSON output
   --raw                   Print raw response body
@@ -182,6 +184,25 @@ mcp2cli --graphql https://api.example.com/graphql --search "user"
 ```
 
 `--search` implies `--list` — shows only matching tools.
+
+### Inspecting a tool's raw schema
+
+`--list --json` flattens each tool into CLI parameters and drops nested
+structure. To read the exact wire contract (nested objects, `anyOf`, `default`,
+`outputSchema`), print the raw definition:
+
+```bash
+# Wire name, or the kebab-case name shown by --list
+mcp2cli --mcp https://mcp.example.com/sse --schema getUserProfile
+mcp2cli --mcp https://mcp.example.com/sse --schema get-user-profile
+
+# After the tool name, including through a session
+mcp2cli --mcp https://mcp.example.com/sse get-user-profile --schema
+mcp2cli --session work get-user-profile --schema
+```
+
+Output is the server's own `tools/list` entry — `inputSchema`, `outputSchema`,
+`annotations`, and property names such as `fooBar` are never renamed.
 
 ### POST with JSON body from stdin
 

@@ -139,6 +139,28 @@ mcp2cli --mcp-stdio "node server.js" --env API_KEY=sk-... --env DEBUG=1 \
   search --query "test"
 ```
 
+### Raw tool definitions (`--schema`)
+
+`--list` shows a token-cheap, flattened view of each tool's parameters. When you
+need the exact wire contract — nested objects, `anyOf` branches, `default`,
+`outputSchema` — ask for the raw definition instead:
+
+```bash
+# Global form: wire name, or the kebab-case name shown by --list
+mcp2cli --mcp https://example.com/mcp --schema getUserProfile
+mcp2cli --mcp https://example.com/mcp --schema get-user-profile
+
+# After the tool name, including inside a session
+mcp2cli --mcp https://example.com/mcp get-user-profile --schema
+mcp2cli --session work get-user-profile --schema
+```
+
+The output is the server's own `tools/list` entry. Property names such as
+`fooBar` stay `fooBar`, and `inputSchema` / `outputSchema` / `annotations` keep
+their wire spelling — nothing is renamed or flattened.
+
+Only MCP sources support `--schema`; `--spec` and `--graphql` reject it.
+
 ### MCP roots and completion
 
 Expose one or more filesystem roots when a server scopes operations to a
@@ -362,6 +384,8 @@ Options:
   --refresh               Bypass cache
   --list                  List available subcommands
   --search PATTERN        Search tools by name or description (implies --list)
+  --schema TOOL           Print one MCP tool's raw definition (inputSchema,
+                          outputSchema, annotations) with wire names preserved
   --sort MODE             Sort --list output: usage|recent|alpha|default
   --top N                 Show only the top N tools in --list output
   --compact               Space-separated tool names only, no descriptions
