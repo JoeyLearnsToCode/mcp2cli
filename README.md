@@ -163,6 +163,43 @@ mcp2cli --mcp https://example.com/mcp \
 Both options work when starting a persistent session; roots are retained by
 the session daemon and completion requests can be sent through `--session`.
 
+### Sessions — reuse one MCP connection
+
+A one-shot call pays for starting the server and running `initialize` every
+time. A named session keeps one daemon — and one MCP connection — alive and
+routes later calls to it.
+
+```bash
+# Start a daemon that owns the connection
+mcp2cli --session-start work --mcp-stdio "npx @modelcontextprotocol/server-filesystem ."
+
+# Call tools through it — no reconnect, no re-initialize
+mcp2cli --session work --list
+mcp2cli --session work read-file --path ./README.md
+
+# Inspect and stop
+mcp2cli --session-list
+mcp2cli --session-stop work
+```
+
+Sessions live under `~/.cache/mcp2cli/sessions` (override with
+`MCP2CLI_CACHE_DIR`). The daemon is detached from the shell that started it,
+so closing that terminal does not end the session.
+
+How a client reaches the daemon depends on the platform:
+
+| Platform | Transport | Notes |
+|---|---|---|
+| macOS, Linux | Unix domain socket (`<name>.sock`) | `sessions/` is `0700`, metadata `0600` |
+| Windows | Loopback TCP on `127.0.0.1` | Windows CPython has no `socket.AF_UNIX` |
+
+Every request carries a per-session token that the daemon generates on start,
+so another local process cannot drive your session by connecting to its port.
+`--session-stop` asks the daemon to exit over that same channel, which lets it
+close the MCP server cleanly and delete its own files. Set
+`MCP2CLI_SESSION_TRANSPORT=unix|tcp` to pin a transport instead of taking the
+platform default.
+
 ### OpenAPI mode
 
 ```bash

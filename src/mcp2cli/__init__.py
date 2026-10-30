@@ -9,11 +9,13 @@ __version__ = _pkg_version("mcp2cli")
 import argparse
 import copy
 import hashlib
+import hmac
 import json
 import mimetypes
 import os
 import fnmatch
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -34,6 +36,8 @@ from datetime import datetime, timezone
 
 import anyio
 import httpx
+
+IS_WINDOWS = os.name == "nt"
 
 CACHE_DIR = Path(
     os.environ.get("MCP2CLI_CACHE_DIR", Path.home() / ".cache" / "mcp2cli")
@@ -241,7 +245,7 @@ def split_shell_command(command: str) -> list[str]:
     ``D:toolspython.exe``).  On Windows keep the backslashes and strip any
     surrounding quotes instead.
     """
-    if os.name == "nt":
+    if IS_WINDOWS:
         parts = shlex.split(command, posix=False)
         return [
             p[1:-1] if len(p) >= 2 and p[0] == p[-1] and p[0] in "\"'" else p
@@ -800,15 +804,23 @@ def load_cached(key: str, ttl: int) -> dict | None:
     exactly this.
     """
     path = CACHE_DIR / f"{key}.json"
-    if not path.exists():
-        return None
-    try:
-        age = time.time() - path.stat().st_mtime
-        if age >= ttl:
+    # On Windows a concurrent os.replace() and this read exclude each other, so
+    # a read can fail with a sharing violation that lasts one syscall. Retry
+    # briefly instead of reporting a miss the caller would refetch for.
+    for attempt in range(6):
+        if not path.exists():
             return None
-        return json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
-        return None
+        try:
+            age = time.time() - path.stat().st_mtime
+            if age >= ttl:
+                return None
+            return json.loads(path.read_text())
+        except PermissionError:
+            if attempt == 5:
+                return None
+            time.sleep(0.01)
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            return None
 
 
 def save_cache(key: str, data: dict):
@@ -840,7 +852,20 @@ def save_cache(key: str, data: dict):
             fh.write(payload)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, path)
+        # Windows refuses to replace a file that another process holds open for
+        # reading, so a concurrent reader turns the swap into PermissionError.
+        # Readers only hold the file for one read, so retry briefly; if the
+        # entry stays locked the previous value is still valid, and the cache
+        # is an optimisation, not a correctness requirement.
+        for attempt in range(6):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if attempt == 5:
+                    os.unlink(tmp)
+                    return
+                time.sleep(0.01)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -3989,6 +4014,9 @@ async def _handle_prompts(
 
 SESSIONS_DIR = CACHE_DIR / "sessions"
 
+# Bumped whenever the metadata or request shape changes.
+_SESSION_PROTOCOL_VERSION = 2
+
 
 def _session_meta_path(name: str) -> Path:
     return SESSIONS_DIR / f"{name}.json"
@@ -4000,7 +4028,139 @@ def _session_sock_path(name: str) -> Path:
 def _session_log_path(name: str) -> Path:
     return SESSIONS_DIR / f"{name}.log"
 
+
+def _session_transport_kind() -> str:
+    """Which IPC transport session daemons use on this host.
+
+    Windows has no ``socket.AF_UNIX``, so sessions ride loopback TCP there.
+    ``MCP2CLI_SESSION_TRANSPORT`` pins a transport, which is how the TCP path
+    is exercised from the POSIX test matrix.
+    """
+    forced = os.environ.get("MCP2CLI_SESSION_TRANSPORT", "").strip().lower()
+    if forced in ("unix", "tcp"):
+        return forced
+    return "unix" if hasattr(socket, "AF_UNIX") else "tcp"
+
+
+def _session_read_meta(name: str) -> dict | None:
+    """Read published metadata, or None while it is missing or half written."""
+    try:
+        meta = json.loads(_session_meta_path(name).read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    return meta if isinstance(meta, dict) else None
+
+
+def _session_write_meta(meta_path: Path, meta: dict):
+    """Publish metadata atomically — the starter and clients poll this file."""
+    tmp_path = meta_path.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(meta))
+    if not IS_WINDOWS:
+        with suppress(OSError):
+            os.chmod(tmp_path, 0o600)  # the file carries the session token
+    os.replace(tmp_path, meta_path)
+
+
+def _session_endpoint(meta: dict | None) -> dict | None:
+    endpoint = (meta or {}).get("endpoint")
+    return endpoint if isinstance(endpoint, dict) else None
+
+
+def _session_listen(name: str) -> tuple:
+    """Create the daemon's listening socket and describe it for clients."""
+    if _session_transport_kind() == "tcp":
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            # SO_REUSEADDR would let another local process rebind this port
+            # between our bind and a client's connect; Windows can forbid
+            # that outright, and omitting REUSEADDR does the same elsewhere.
+            exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+            if exclusive is not None:
+                server.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+            server.bind(("127.0.0.1", 0))
+            host, port = server.getsockname()[:2]
+            endpoint = {"kind": "tcp", "host": host, "port": port}
+            server.listen(5)
+            server.settimeout(1.0)
+        except OSError:
+            server.close()
+            raise
+        return server, endpoint
+
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock_path = _session_sock_path(name)
+    try:
+        server.bind(str(sock_path))
+        server.listen(5)
+        server.settimeout(1.0)
+    except OSError:
+        server.close()
+        raise
+    return server, {"kind": "unix", "path": str(sock_path)}
+
+
+def _session_connect(endpoint: dict, timeout: float = 5.0) -> socket.socket:
+    """Open a client connection to a daemon endpoint."""
+    if endpoint.get("kind") == "tcp":
+        return socket.create_connection(
+            (endpoint["host"], int(endpoint["port"])), timeout=timeout
+        )
+    if not hasattr(socket, "AF_UNIX"):
+        raise OSError(f"unsupported session endpoint: {endpoint!r}")
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        conn.settimeout(timeout)
+        conn.connect(str(endpoint["path"]))
+    except OSError:
+        conn.close()
+        raise
+    return conn
+
+
+def _session_send(
+    meta: dict, method: str, params: dict | None = None, timeout: float = 5.0
+) -> dict:
+    """Send one request to a session daemon and return the decoded response."""
+    endpoint = _session_endpoint(meta)
+    if endpoint is None:
+        raise OSError("session has no endpoint")
+    request = {
+        "id": 1,
+        "method": method,
+        "params": params or {},
+        "token": meta.get("token", ""),
+    }
+    conn = _session_connect(endpoint, timeout=timeout)
+    try:
+        conn.settimeout(timeout)
+        conn.sendall(json.dumps(request).encode() + b"\n")
+        conn.shutdown(socket.SHUT_WR)
+        data = b""
+        while True:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+        return json.loads(data.decode())
+    finally:
+        conn.close()
+
+
 def _session_is_alive(meta: dict) -> bool:
+    """Whether the daemon described by ``meta`` still answers.
+
+    A round trip beats ``os.kill(pid, 0)``: on Windows that call wraps
+    OpenProcess/TerminateProcess rather than a POSIX existence check, and a
+    recycled PID would pass on any platform.
+    """
+    if _session_endpoint(meta) is not None:
+        try:
+            response = _session_send(meta, "ping", timeout=1.0)
+        except (OSError, json.JSONDecodeError):
+            return False
+        return (response.get("result") or {}).get("pong") is True
+
+    # Metadata written by an older mcp2cli: fall back to the PID probe.
     pid = meta.get("pid")
     if pid is None:
         return False
@@ -4033,24 +4193,46 @@ def session_stop(name: str):
     meta_path = _session_meta_path(name)
     sock_path = _session_sock_path(name)
     log_path = _session_log_path(name)
-    if meta_path.exists():
-        try:
-            meta = json.loads(meta_path.read_text())
-            pid = meta.get("pid")
-            if pid and _session_is_alive(meta):
+
+    meta = _session_read_meta(name) or {}
+    pid = meta.get("pid")
+    if meta and _session_is_alive(meta):
+        # Ask the daemon to exit first: it closes the MCP session and removes
+        # its own files. A signal cannot do that on Windows, where os.kill()
+        # is TerminateProcess and never reaches the daemon's handler.
+        if _session_endpoint(meta) is not None:
+            try:
+                _session_send(meta, "shutdown", timeout=5.0)
+            except (OSError, json.JSONDecodeError):
+                pass
+        deadline = time.time() + 5
+        while time.time() < deadline and _session_is_alive(meta):
+            time.sleep(0.1)
+        if pid and _session_is_alive(meta):
+            try:
                 os.kill(pid, signal.SIGTERM)
-                # Wait briefly for clean shutdown
-                for _ in range(10):
-                    try:
-                        os.kill(pid, 0)
-                        time.sleep(0.1)
-                    except OSError:
-                        break
-        except (json.JSONDecodeError, OSError):
-            pass
-        meta_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    meta_path.unlink(missing_ok=True)
     sock_path.unlink(missing_ok=True)
     log_path.unlink(missing_ok=True)
+
+
+def _session_spawn_kwargs() -> dict:
+    """Detach the daemon from this process's console.
+
+    ``start_new_session`` is POSIX-only: CPython accepts and silently ignores
+    it on Windows, where a console-less child needs creation flags instead.
+    Without them closing the terminal takes the session down with it.
+    """
+    if IS_WINDOWS:
+        return {
+            "creationflags": (
+                subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+        }
+    return {"start_new_session": True}
 
 
 def session_start(
@@ -4064,20 +4246,20 @@ def session_start(
 ):
     """Start a persistent session daemon."""
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    if not IS_WINDOWS:
+        with suppress(OSError):
+            os.chmod(SESSIONS_DIR, 0o700)  # it holds session tokens
 
     # Check if already running
     meta_path = _session_meta_path(name)
     if meta_path.exists():
-        try:
-            meta = json.loads(meta_path.read_text())
-            if _session_is_alive(meta):
-                print(
-                    f"Session '{name}' is already running (PID {meta['pid']})",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-        except (json.JSONDecodeError, OSError):
-            pass
+        meta = _session_read_meta(name)
+        if meta is not None and _session_is_alive(meta):
+            print(
+                f"Session '{name}' is already running (PID {meta.get('pid', '?')})",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         # Stale session — clean up
         meta_path.unlink(missing_ok=True)
         _session_sock_path(name).unlink(missing_ok=True)
@@ -4110,7 +4292,7 @@ def session_start(
                     "import mcp2cli; mcp2cli._run_session_daemon(config)"
                 ),
             ],
-            start_new_session=True,
+            **_session_spawn_kwargs(),
             stdout=log_file,
             stderr=log_file,
             stdin=subprocess.PIPE,
@@ -4124,12 +4306,15 @@ def session_start(
         with suppress(BrokenPipeError), proc.stdin:
             proc.stdin.write(daemon_config.encode("utf-8"))
 
-    # Wait for socket to appear
-    sock_path = _session_sock_path(name)
+    # Wait until the daemon publishes its endpoint. A file check replaces the
+    # old ".sock appeared" probe, which only ever existed on POSIX.
     deadline = time.time() + 15
     while time.time() < deadline:
-        if sock_path.exists():
-            print(f"Session '{name}' started (PID {proc.pid})")
+        meta = _session_read_meta(name)
+        if _session_endpoint(meta) is not None:
+            # The daemon reports its own PID; on Windows `sys.executable` can
+            # be a venv launcher whose PID is not the interpreter's.
+            print(f"Session '{name}' started (PID {meta.get('pid', proc.pid)})")
             return
         if proc.poll() is not None:
             print(
@@ -4305,30 +4490,35 @@ def _run_session_daemon(config_json: str):
         async def _run_with_session(session):
             await session.initialize()
 
-            # Write metadata
-            meta = {
-                "pid": os.getpid(),
-                "source": source,
-                "transport": "stdio" if is_stdio else "http",
-                "created_at": time.time(),
-            }
-            meta_path.write_text(json.dumps(meta))
+            # Publish metadata only once the endpoint is listening: the
+            # starter polls this file, and a client must never be pointed at
+            # a port that refuses connections.
+            server_sock, endpoint = _session_listen(name)
+            token = secrets.token_hex(16)
+            _session_write_meta(
+                meta_path,
+                {
+                    "pid": os.getpid(),
+                    "source": source,
+                    "transport": "stdio" if is_stdio else "http",
+                    "created_at": time.time(),
+                    "endpoint": endpoint,
+                    "token": token,
+                    "v": _SESSION_PROTOCOL_VERSION,
+                },
+            )
 
-            # Start Unix domain socket server
-            server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
-                server_sock.bind(str(sock_path))
-                server_sock.listen(5)
-                server_sock.settimeout(1.0)
-
-                # Handle SIGTERM
                 _shutdown = False
 
                 def _on_sigterm(*_):
                     nonlocal _shutdown
                     _shutdown = True
 
-                signal.signal(signal.SIGTERM, _on_sigterm)
+                # Windows never runs this handler: os.kill() there is
+                # TerminateProcess. Shutdown arrives as an RPC instead.
+                if not IS_WINDOWS:
+                    signal.signal(signal.SIGTERM, _on_sigterm)
 
                 def _blocking_accept():
                     """Accept a connection in a thread (blocks until connection or timeout)."""
@@ -4341,6 +4531,17 @@ def _run_session_daemon(config_json: str):
                             return None, None
                     return None, None
 
+                def _recv_request(c):
+                    data = b""
+                    while True:
+                        chunk = c.recv(65536)
+                        if not chunk:
+                            break
+                        data += chunk
+                        if b"\n" in data:
+                            break
+                    return data
+
                 while not _shutdown:
                     conn, _ = await anyio.to_thread.run_sync(_blocking_accept)
                     if conn is None:
@@ -4348,24 +4549,11 @@ def _run_session_daemon(config_json: str):
 
                     try:
                         conn.settimeout(5)
-
-                        def _recv_request(c):
-                            data = b""
-                            while True:
-                                chunk = c.recv(65536)
-                                if not chunk:
-                                    break
-                                data += chunk
-                                if b"\n" in data:
-                                    break
-                            return data
-
                         raw = await anyio.to_thread.run_sync(
                             lambda: _recv_request(conn)
                         )
                         line = raw.split(b"\n", 1)[0]
                         if not line:
-                            conn.close()
                             continue
 
                         request = json.loads(line)
@@ -4373,21 +4561,39 @@ def _run_session_daemon(config_json: str):
                         method = request.get("method", "")
                         params = request.get("params", {})
 
-                        try:
-                            resp_data = await _dispatch(session, method, params)
-                            response = (
-                                json.dumps({"id": req_id, "result": resp_data}) + "\n"
+                        if not hmac.compare_digest(
+                            str(request.get("token", "")), token
+                        ):
+                            # Anything that can reach a loopback port is not
+                            # necessarily the user who started the session.
+                            response = json.dumps(
+                                {"id": req_id, "error": "unauthorized"}
                             )
-                        except Exception as e:
-                            response = (
-                                json.dumps({"id": req_id, "error": str(e)}) + "\n"
+                        elif method == "ping":
+                            response = json.dumps(
+                                {"id": req_id, "result": {"pong": True}}
                             )
+                        elif method == "shutdown":
+                            response = json.dumps(
+                                {"id": req_id, "result": {"ok": True}}
+                            )
+                            _shutdown = True
+                        else:
+                            try:
+                                resp_data = await _dispatch(session, method, params)
+                                response = json.dumps(
+                                    {"id": req_id, "result": resp_data}
+                                )
+                            except Exception as e:
+                                response = json.dumps(
+                                    {"id": req_id, "error": str(e)}
+                                )
 
                         def _send(c, data):
                             c.sendall(data)
 
                         await anyio.to_thread.run_sync(
-                            lambda: _send(conn, response.encode())
+                            lambda: _send(conn, (response + "\n").encode())
                         )
                     except Exception:
                         pass
@@ -4441,32 +4647,21 @@ def _run_session_daemon(config_json: str):
 
 def _session_request(name: str, method: str, params: dict | None = None) -> any:
     """Send a request to a session daemon and return the result."""
-    sock_path = _session_sock_path(name)
-    if not sock_path.exists():
+    meta = _session_read_meta(name)
+    if _session_endpoint(meta) is None:
         print(f"Error: session '{name}' not found", file=sys.stderr)
         sys.exit(1)
 
-    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        conn.connect(str(sock_path))
-        request = json.dumps({"id": 1, "method": method, "params": params or {}}) + "\n"
-        conn.sendall(request.encode())
-        conn.shutdown(socket.SHUT_WR)
+        response = _session_send(meta, method, params)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Error: session '{name}' is not reachable: {exc}", file=sys.stderr)
+        sys.exit(1)
 
-        data = b""
-        while True:
-            chunk = conn.recv(65536)
-            if not chunk:
-                break
-            data += chunk
-
-        response = json.loads(data.decode())
-        if "error" in response:
-            print(f"Error: {response['error']}", file=sys.stderr)
-            sys.exit(1)
-        return response["result"]
-    finally:
-        conn.close()
+    if "error" in response:
+        print(f"Error: {response['error']}", file=sys.stderr)
+        sys.exit(1)
+    return response["result"]
 
 
 # ---------------------------------------------------------------------------
